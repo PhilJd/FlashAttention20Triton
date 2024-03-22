@@ -6,51 +6,115 @@ import triton.language as tl
 
 
 @triton.jit
-def max_fn(x, y):
-    return tl.math.max(x, y)
-
-
-@triton.jit
 def _fwd_kernel(
-    Q, K, V, sm_scale,
+    Q,
+    K,
+    V,
+    sm_scale,
     L,
     Out,
-    stride_qz, stride_qh, stride_qm, stride_qk,
-    stride_kz, stride_kh, stride_kn, stride_kk,
-    stride_vz, stride_vh, stride_vk, stride_vn,
-    stride_oz, stride_oh, stride_om, stride_on,
-    Z, H, N_CTX,
-    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vk,
+    stride_vn,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_on,
+    Z,
+    H,
+    N_CTX,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
 ):
+    """_summary_
+
+
+    Core ideas:
+    - Push the scale by 1/sum_x e^x to the very end. I.e., accumulate the values
+      unscaled.
+    - Then we only need to rescale the accumulated values when the maximum has
+      changed.
+    - The shift x - max(x) in the softmax can be expressed as a multiplication:
+      e^(x-m_i) = e^x * e^(-m_i). As a result, we can only store a single
+      factor to multiply with, which is the combination of the softmax
+      denominator and the max shift.  sum_x{e^(x-m_i)} * e^(-m_i)
+
+    Args:
+        Q: The input Query tensor. # TODO add shapes
+        K: The input Key Tensor.
+        V: The input Value tensor.
+        sm_scale: "Softmax" Scale? Note that this is multiplied with q, while
+            typical softmax implementations multiply the scale with dot(QK).
+            That's equivalent though.
+            sm_scale * (q1* k1 + q2* k2 + q3 * k3)
+            = (sm_scale * q1* k1 + sm_scale * q2* k2 + sm_scale * q3 * k3)
+            -> More efficient as soon as dim(q) < num keys.
+        L: The output tensor of shape (Batch * num_heads, seq_length)
+           to save the logsumexp 𝐿 ( 𝑗) = 𝑚 ( 𝑗) + log(ℓ( 𝑗) ), containing the
+           max m used to center the input values and the softmax denominator.
+           This is required for the backward pass to undo the scaling.
+        Out:
+        stride_qz:
+        stride_qh:
+        stride_qm:
+        stride_qk:
+        stride_kz:
+        stride_kh:
+        stride_kn:
+        stride_kk:
+        stride_vz:
+        stride_vh:
+        stride_vk:
+        stride_vn:
+        stride_oz:
+        stride_oh:
+        stride_om:
+        stride_on:
+        Z: Batch size, unsused.
+        H: Number of heads, unused.
+        N_CTX: The sequence length. Note that the code below passes the query
+            sequence length. TODO(Phil): Shouldn't this be kv seq length?
+        BLOCK_M: Block over the query sequence length. This will load BLOCK_M
+            queries.
+        BLOCK_DMODEL: The size of a single head. Note that there is no iteration
+            on this dimension, i.e., unlike for the other block sizes,
+            BLOCK_DMODEL=32 can't be used for a head of size 64.
+        BLOCK_N: block size of the key+value sequence length. This means, for a
+            single *query* block, we iterate num_keys / BLOCK_N times.
+        IS_CAUSAL:
+    """
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
     qvk_offset = off_hz * stride_qh
-    Q_block_ptr = tl.make_block_ptr(
-        base=Q + qvk_offset,
-        shape=(N_CTX, BLOCK_DMODEL),
-        strides=(stride_qm, stride_qk),
-        offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, BLOCK_DMODEL),
-        order=(1, 0)
-    )
-    K_block_ptr = tl.make_block_ptr(
-        base=K + qvk_offset,
-        shape=(BLOCK_DMODEL, N_CTX),
-        strides=(stride_kk, stride_kn),
-        offsets=(0, 0),
-        block_shape=(BLOCK_DMODEL, BLOCK_N),
-        order=(0, 1)
-    )
-    V_block_ptr = tl.make_block_ptr(
-        base=V + qvk_offset,
-        shape=(N_CTX, BLOCK_DMODEL),
-        strides=(stride_vk, stride_vn),
-        offsets=(0, 0),
-        block_shape=(BLOCK_N, BLOCK_DMODEL),
-        order=(1, 0)
-    )
+    Q_block_ptr = tl.make_block_ptr(base=Q + qvk_offset,
+                                    shape=(N_CTX, BLOCK_DMODEL),
+                                    strides=(stride_qm, stride_qk),
+                                    offsets=(start_m * BLOCK_M, 0),
+                                    block_shape=(BLOCK_M, BLOCK_DMODEL),
+                                    order=(1, 0))
+    K_block_ptr = tl.make_block_ptr(base=K + qvk_offset,
+                                    shape=(BLOCK_DMODEL, N_CTX),
+                                    strides=(stride_kk, stride_kn),
+                                    offsets=(0, 0),
+                                    block_shape=(BLOCK_DMODEL, BLOCK_N),
+                                    order=(0, 1))
+    V_block_ptr = tl.make_block_ptr(base=V + qvk_offset,
+                                    shape=(N_CTX, BLOCK_DMODEL),
+                                    strides=(stride_vk, stride_vn),
+                                    offsets=(0, 0),
+                                    block_shape=(BLOCK_N, BLOCK_DMODEL),
+                                    order=(1, 0))
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -75,11 +139,12 @@ def _fwd_kernel(
         # -- compute qk ---
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         if IS_CAUSAL:
-            qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
+            qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk,
+                          float("-inf"))
         qk += tl.dot(q, k)
         # -- compute scaling constant ---
         m_i_new = tl.maximum(m_i, tl.max(qk, 1))
-        alpha = tl.math.exp2(m_i - m_i_new)
+
         p = tl.math.exp2(qk - m_i_new[:, None])
         # -- scale and update acc --
         acc_scale = l_i * 0 + alpha  # workaround some compiler bug
@@ -96,22 +161,22 @@ def _fwd_kernel(
     l_ptrs = L + off_hz * N_CTX + offs_m
     tl.store(l_ptrs, m_i + tl.math.log2(l_i))
     # write back O
-    O_block_ptr = tl.make_block_ptr(
-        base=Out + qvk_offset,
-        shape=(N_CTX, BLOCK_DMODEL),
-        strides=(stride_om, stride_on),
-        offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, BLOCK_DMODEL),
-        order=(1, 0)
-    )
+    O_block_ptr = tl.make_block_ptr(base=Out + qvk_offset,
+                                    shape=(N_CTX, BLOCK_DMODEL),
+                                    strides=(stride_om, stride_on),
+                                    offsets=(start_m * BLOCK_M, 0),
+                                    block_shape=(BLOCK_M, BLOCK_DMODEL),
+                                    order=(1, 0))
     tl.store(O_block_ptr, acc.to(tl.float16))
 
 
 @triton.jit
 def _bwd_preprocess(
-    Out, DO,
+    Out,
+    DO,
     Delta,
-    BLOCK_M: tl.constexpr, D_HEAD: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    D_HEAD: tl.constexpr,
 ):
     off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     off_n = tl.arange(0, D_HEAD)
@@ -126,19 +191,77 @@ def _bwd_preprocess(
 
 @triton.jit
 def _bwd_kernel(
-    Q, K, V, sm_scale, Out, DO,
-    DQ, DK, DV,
+    Q,
+    K,
+    V,
+    sm_scale,
+    Out,
+    DO,
+    DQ,
+    DK,
+    DV,
     L,
     D,
-    stride_qz, stride_qh, stride_qm, stride_qk,
-    stride_kz, stride_kh, stride_kn, stride_kk,
-    stride_vz, stride_vh, stride_vk, stride_vn,
-    Z, H, N_CTX,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vk,
+    stride_vn,
+    Z,
+    H,
+    N_CTX,
     num_block,
-    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr,
 ):
+    """_summary_
+
+    The main idea of Flash Attention is to never store the attention weight
+    matrix. This means, in the backward pass, we need to recompute the attention
+    weights to compute gradients wrt queries, keys and values.
+
+    Args:
+        Q (_type_): _description_
+        K (_type_): _description_
+        V (_type_): _description_
+        sm_scale (_type_): _description_
+        Out (_type_): _description_
+        DO (_type_): _description_
+        DQ (_type_): _description_
+        DK (_type_): _description_
+        DV (_type_): _description_
+        L (_type_): _description_
+        D (_type_): _description_
+        stride_qz (_type_): _description_
+        stride_qh (_type_): _description_
+        stride_qm (_type_): _description_
+        stride_qk (_type_): _description_
+        stride_kz (_type_): _description_
+        stride_kh (_type_): _description_
+        stride_kn (_type_): _description_
+        stride_kk (_type_): _description_
+        stride_vz (_type_): _description_
+        stride_vh (_type_): _description_
+        stride_vk (_type_): _description_
+        stride_vn (_type_): _description_
+        Z (_type_): _description_
+        H (_type_): _description_
+        N_CTX (_type_): _description_
+        num_block (_type_): _description_
+        BLOCK_M (tl.constexpr): _description_
+        BLOCK_DMODEL (tl.constexpr): _description_
+        BLOCK_N (tl.constexpr): _description_
+        CAUSAL (tl.constexpr): _description_
+    """
     off_hz = tl.program_id(0)
     off_z = off_hz // H
     off_h = off_hz % H
@@ -162,11 +285,14 @@ def _bwd_kernel(
         offs_m = tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_DMODEL)
         # initialize pointers to value-like data
-        q_ptrs = Q + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        q_ptrs = Q + (offs_qm[:, None] * stride_qm +
+                      offs_k[None, :] * stride_qk)
         k_ptrs = K + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
         v_ptrs = V + (offs_n[:, None] * stride_qm + offs_k[None, :] * stride_qk)
-        do_ptrs = DO + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
-        dq_ptrs = DQ + (offs_qm[:, None] * stride_qm + offs_k[None, :] * stride_qk)
+        do_ptrs = DO + (offs_qm[:, None] * stride_qm +
+                        offs_k[None, :] * stride_qk)
+        dq_ptrs = DQ + (offs_qm[:, None] * stride_qm +
+                        offs_k[None, :] * stride_qk)
         # pointer to row-wise quantities in value-like data
         D_ptrs = D + off_hz * N_CTX
         l_ptrs = L + off_hz * N_CTX
@@ -183,7 +309,8 @@ def _bwd_kernel(
             q = tl.load(q_ptrs)
             # recompute p = softmax(qk, dim=-1).T
             if CAUSAL:
-                qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), float(0.), float("-inf"))
+                qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]),
+                              float(0.), float("-inf"))
             else:
                 qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
             qk += tl.dot(q, tl.trans(k))
@@ -210,8 +337,10 @@ def _bwd_kernel(
             q_ptrs += BLOCK_M * stride_qm
             do_ptrs += BLOCK_M * stride_qm
         # write-back
-        dv_ptrs = DV + (offs_n[:, None] * stride_qm + offs_k[None, :] * stride_qk)
-        dk_ptrs = DK + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk)
+        dv_ptrs = DV + (offs_n[:, None] * stride_qm +
+                        offs_k[None, :] * stride_qk)
+        dk_ptrs = DK + (offs_n[:, None] * stride_kn +
+                        offs_k[None, :] * stride_kk)
         tl.store(dv_ptrs, dv)
         tl.store(dk_ptrs, dk)
 
@@ -231,22 +360,44 @@ class _attention(torch.autograd.Function):
         BLOCK_M = 128
         BLOCK_N = 64
         grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
-        L = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+        # Allocate storage for the softmax denominator:
+        # Batch * Num_heads, query_seq_length.
+        L = torch.empty((q.shape[0] * q.shape[1], q.shape[2]),
+                        device=q.device,
+                        dtype=torch.float32)
 
         num_warps = 4 if Lk <= 64 else 8
-        _fwd_kernel[grid](
-            q, k, v, sm_scale,
-            L,
-            o,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            q.shape[0], q.shape[1], q.shape[2],
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=Lk,
-            IS_CAUSAL=causal,
-            num_warps=num_warps,
-            num_stages=4)
+        _fwd_kernel[grid](q,
+                          k,
+                          v,
+                          sm_scale,
+                          L,
+                          o,
+                          q.stride(0),
+                          q.stride(1),
+                          q.stride(2),
+                          q.stride(3),
+                          k.stride(0),
+                          k.stride(1),
+                          k.stride(2),
+                          k.stride(3),
+                          v.stride(0),
+                          v.stride(1),
+                          v.stride(2),
+                          v.stride(3),
+                          o.stride(0),
+                          o.stride(1),
+                          o.stride(2),
+                          o.stride(3),
+                          q.shape[0],
+                          q.shape[1],
+                          q.shape[2],
+                          BLOCK_M=BLOCK_M,
+                          BLOCK_N=BLOCK_N,
+                          BLOCK_DMODEL=Lk,
+                          IS_CAUSAL=causal,
+                          num_warps=num_warps,
+                          num_stages=4)
 
         ctx.save_for_backward(q, k, v, o, L)
         ctx.grid = grid
@@ -264,23 +415,45 @@ class _attention(torch.autograd.Function):
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
         delta = torch.empty_like(L)
-        _bwd_preprocess[(ctx.grid[0] * ctx.grid[1], )](
-            o, do,
+        _bwd_preprocess[(ctx.grid[0] * ctx.grid[1],)](
+            o,
+            do,
             delta,
-            BLOCK_M=BLOCK, D_HEAD=ctx.BLOCK_DMODEL,
+            BLOCK_M=BLOCK,
+            D_HEAD=ctx.BLOCK_DMODEL,
         )
         _bwd_kernel[(ctx.grid[1],)](
-            q, k, v, ctx.sm_scale,
-            o, do,
-            dq, dk, dv,
-            L, delta,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            q.shape[0], q.shape[1], q.shape[2],
+            q,
+            k,
+            v,
+            ctx.sm_scale,
+            o,
+            do,
+            dq,
+            dk,
+            dv,
+            L,
+            delta,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
             ctx.grid[0],
-            BLOCK_M=BLOCK, BLOCK_N=BLOCK,
-            BLOCK_DMODEL=ctx.BLOCK_DMODEL, num_warps=8,
+            BLOCK_M=BLOCK,
+            BLOCK_N=BLOCK,
+            BLOCK_DMODEL=ctx.BLOCK_DMODEL,
+            num_warps=8,
             CAUSAL=ctx.causal,
             num_stages=1,
         )
@@ -294,9 +467,12 @@ attention = _attention.apply
 @pytest.mark.parametrize('causal', [False, True])
 def test_op(Z, H, N_CTX, D_HEAD, causal, dtype=torch.float16):
     torch.manual_seed(20)
-    q = torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0., std=0.5).requires_grad_()
-    k = torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0., std=0.5).requires_grad_()
-    v = torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0., std=0.5).requires_grad_()
+    q = torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype,
+                    device="cuda").normal_(mean=0., std=0.5).requires_grad_()
+    k = torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype,
+                    device="cuda").normal_(mean=0., std=0.5).requires_grad_()
+    v = torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype,
+                    device="cuda").normal_(mean=0., std=0.5).requires_grad_()
     sm_scale = 0.5
     dout = torch.randn_like(q)
     # reference implementation
@@ -337,28 +513,53 @@ HAS_FLASH = FLASH_VER is not None
 
 BATCH, N_HEADS, N_CTX, D_HEAD = 4, 48, 4096, 64
 # vary seq length for fixed head and batch=4
-configs = [triton.testing.Benchmark(
-    x_names=['N_CTX'],
-    x_vals=[2**i for i in range(10, 15)],
-    line_arg='provider',
-    line_vals=['triton'] + (['flash'] if HAS_FLASH else []),
-    line_names=['Triton'] + ([f'Flash-{FLASH_VER}'] if HAS_FLASH else []),
-    styles=[('red', '-'), ('blue', '-')],
-    ylabel='ms',
-    plot_name=f'fused-attention-batch{BATCH}-head{N_HEADS}-d{D_HEAD}-{mode}',
-    args={'H': N_HEADS, 'BATCH': BATCH, 'D_HEAD': D_HEAD, 'dtype': torch.float16, 'mode': mode, 'causal': causal}
-) for mode in ['fwd', 'bwd'] for causal in [False, True]]
+configs = [
+    triton.testing.Benchmark(
+        x_names=['N_CTX'],
+        x_vals=[2**i for i in range(10, 15)],
+        line_arg='provider',
+        line_vals=['triton'] + (['flash'] if HAS_FLASH else []),
+        line_names=['Triton'] + ([f'Flash-{FLASH_VER}'] if HAS_FLASH else []),
+        styles=[('red', '-'), ('blue', '-')],
+        ylabel='ms',
+        plot_name=f'fused-attention-batch{BATCH}-head{N_HEADS}-d{D_HEAD}-{mode}',
+        args={
+            'H': N_HEADS,
+            'BATCH': BATCH,
+            'D_HEAD': D_HEAD,
+            'dtype': torch.float16,
+            'mode': mode,
+            'causal': causal
+        }) for mode in ['fwd', 'bwd'] for causal in [False, True]
+]
 
 
 @triton.testing.perf_report(configs)
-def bench_flash_attention(BATCH, H, N_CTX, D_HEAD, causal, mode, provider="triton", dtype=torch.float16, device="cuda"):
+def bench_flash_attention(BATCH,
+                          H,
+                          N_CTX,
+                          D_HEAD,
+                          causal,
+                          mode,
+                          provider="triton",
+                          dtype=torch.float16,
+                          device="cuda"):
     assert mode in ['fwd', 'bwd']
     warmup = 25
     rep = 100
     if provider == "triton":
-        q = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        k = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
-        v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
+        q = torch.randn((BATCH, H, N_CTX, D_HEAD),
+                        dtype=dtype,
+                        device="cuda",
+                        requires_grad=True)
+        k = torch.randn((BATCH, H, N_CTX, D_HEAD),
+                        dtype=dtype,
+                        device="cuda",
+                        requires_grad=True)
+        v = torch.randn((BATCH, H, N_CTX, D_HEAD),
+                        dtype=dtype,
+                        device="cuda",
+                        requires_grad=True)
         sm_scale = 1.3
         fn = lambda: attention(q, k, v, causal, sm_scale)
         if mode == 'bwd':
@@ -367,13 +568,19 @@ def bench_flash_attention(BATCH, H, N_CTX, D_HEAD, causal, mode, provider="trito
             fn = lambda: o.backward(do, retain_graph=True)
         ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
     if provider == "flash":
-        qkv = torch.randn((BATCH, N_CTX, 3, H, D_HEAD), dtype=dtype, device=device, requires_grad=True)
+        qkv = torch.randn((BATCH, N_CTX, 3, H, D_HEAD),
+                          dtype=dtype,
+                          device=device,
+                          requires_grad=True)
         if FLASH_VER == 1:
             lengths = torch.full((BATCH,), fill_value=N_CTX, device=device)
-            cu_seqlens = torch.zeros((BATCH + 1,), device=device, dtype=torch.int32)
+            cu_seqlens = torch.zeros((BATCH + 1,),
+                                     device=device,
+                                     dtype=torch.int32)
             cu_seqlens[1:] = lengths.cumsum(0)
             qkv = qkv.reshape(BATCH * N_CTX, 3, H, D_HEAD)
-            fn = lambda: flash_attn_func(qkv, cu_seqlens, 0., N_CTX, causal=causal)
+            fn = lambda: flash_attn_func(
+                qkv, cu_seqlens, 0., N_CTX, causal=causal)
         elif FLASH_VER == 2:
             fn = lambda: flash_attn_func(qkv, causal=causal)
         else:
